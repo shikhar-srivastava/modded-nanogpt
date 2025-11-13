@@ -959,15 +959,36 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, functional_params=None, functional_use_log_depth: bool = True, rmsnorm_fp32: bool = False, rmsnorm_fp32_fast: bool = False):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, functional_params=None, functional_use_log_depth: bool = True, rmsnorm_fp32: bool = False, rmsnorm_fp32_fast: bool = False, log_rmsnorm: bool = False):
         super().__init__()
         self.layer_idx = layer_idx
         self.functional_params = functional_params
         self.functional_use_log_depth = functional_use_log_depth
         self.rmsnorm_fp32_fast = rmsnorm_fp32_fast
-        # Optional FP32 RMSNorm weights (stored as parameters to ensure FP32 state/updates)
-        self.attn_norm_weight = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if rmsnorm_fp32 else None
-        self.mlp_norm_weight = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if rmsnorm_fp32 else None
+        self.log_rmsnorm = log_rmsnorm
+        
+        # RMSNorm weights: either log-parameterized (w_log) or regular (weight)
+        # If log_rmsnorm: w_log initialized to zeros (exp(0) = 1)
+        # If rmsnorm_fp32: store in FP32 for better gradient precision
+        # Otherwise: will be cast to model dtype (BF16) during model.to()
+        if log_rmsnorm:
+            # Log-parameterized: w_log, initialized to zeros
+            if rmsnorm_fp32:
+                # FP32 w_log for precise gradient accumulation
+                self.attn_norm_weight = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+                self.mlp_norm_weight = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+            else:
+                # Default dtype (will be cast to BF16 by model.to())
+                self.attn_norm_weight = nn.Parameter(torch.zeros(dim))
+                self.mlp_norm_weight = nn.Parameter(torch.zeros(dim))
+        elif rmsnorm_fp32:
+            # Regular weights in FP32
+            self.attn_norm_weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.mlp_norm_weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        else:
+            # No special handling: will be created in default dtype
+            self.attn_norm_weight = None
+            self.mlp_norm_weight = None
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
@@ -998,14 +1019,14 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
-            h = norm(x, self.attn_norm_weight, self.rmsnorm_fp32_fast)
+            h = norm(x, self.attn_norm_weight, self.rmsnorm_fp32_fast, self.log_rmsnorm)
             s = self._compute_functional_scale("attn")
             if s is not None:
                 # Scale is FP32, convert once and fuse with norm output
                 h = h * s.to(h.dtype)
             x = x + self.attn(h, attn_args)
         if self.mlp is not None:
-            h = norm(x, self.mlp_norm_weight, self.rmsnorm_fp32_fast)
+            h = norm(x, self.mlp_norm_weight, self.rmsnorm_fp32_fast, self.log_rmsnorm)
             s = self._compute_functional_scale("mlp")
             if s is not None:
                 # Scale is FP32, convert once and fuse with norm output
@@ -1034,6 +1055,8 @@ class GPT(nn.Module):
         self.use_functional_depth_schedule = bool(getattr(args, "functional_depth_schedule", False))
         self.use_rmsnorm_fp32 = bool(getattr(args, "rmsnorm_fp32", False))
         self.use_rmsnorm_fp32_fast = bool(getattr(args, "rmsnorm_fp32_fast", False))
+        self.use_log_rmsnorm = bool(getattr(args, "log_rmsnorm", False))
+        
         # Functional depth schedule shared parameters (FP32)
         if self.use_functional_depth_schedule:
             self.func_a_attn = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
@@ -1050,16 +1073,33 @@ class GPT(nn.Module):
         else:
             self.functional_use_log_depth = True
             _functional_params = None
-        # Optional FP32 RMSNorm weights for input/final norms
-        if self.use_rmsnorm_fp32:
+        
+        # RMSNorm weights for input/final norms
+        # Log-parameterized (w_log) or regular weights, optionally in FP32
+        if self.use_log_rmsnorm:
+            # Log-parameterized: w_log initialized to zeros (exp(0) = 1)
+            if self.use_rmsnorm_fp32:
+                # FP32 w_log for precise gradient accumulation
+                self.input_norm_weight = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
+                self.final_norm_weight = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
+            else:
+                # Default dtype (will be cast to BF16 by model.to())
+                self.input_norm_weight = nn.Parameter(torch.zeros(model_dim))
+                self.final_norm_weight = nn.Parameter(torch.zeros(model_dim))
+        elif self.use_rmsnorm_fp32:
+            # Regular weights in FP32
             self.input_norm_weight = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
             self.final_norm_weight = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
         else:
+            # No special handling
             self.input_norm_weight = None
             self.final_norm_weight = None
+        
         # Build decoder blocks
         self.blocks = nn.ModuleList([
-            Block(model_dim, head_dim, num_heads, i, functional_params=_functional_params, functional_use_log_depth=self.functional_use_log_depth, rmsnorm_fp32=self.use_rmsnorm_fp32, rmsnorm_fp32_fast=self.use_rmsnorm_fp32_fast)
+            Block(model_dim, head_dim, num_heads, i, functional_params=_functional_params, 
+                  functional_use_log_depth=self.functional_use_log_depth, rmsnorm_fp32=self.use_rmsnorm_fp32, 
+                  rmsnorm_fp32_fast=self.use_rmsnorm_fp32_fast, log_rmsnorm=self.use_log_rmsnorm)
             for i in range(num_layers)
         ])
         self.yarn = Yarn(head_dim, max_seq_len)
@@ -1120,7 +1160,7 @@ class GPT(nn.Module):
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
-        x = x0 = norm(x[None], getattr(self, "input_norm_weight", None), self.use_rmsnorm_fp32_fast)
+        x = x0 = norm(x[None], getattr(self, "input_norm_weight", None), self.use_rmsnorm_fp32_fast, self.use_log_rmsnorm)
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -1151,7 +1191,7 @@ class GPT(nn.Module):
 
         # back out contributions from first 8 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
-        x = norm(x, getattr(self, "final_norm_weight", None), self.use_rmsnorm_fp32_fast)
+        x = norm(x, getattr(self, "final_norm_weight", None), self.use_rmsnorm_fp32_fast, self.use_log_rmsnorm)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
@@ -1380,10 +1420,13 @@ _parser.add_argument("--functional-depth-schedule", dest="functional_depth_sched
 _parser.add_argument("--rmsnorm-fp32", dest="rmsnorm_fp32", action="store_true")
 _parser.add_argument("--rmsnorm-fp32-fast", dest="rmsnorm_fp32_fast", action="store_true",
                     help="Use fused RMSNorm kernel by casting weights to input dtype (faster but less precise)")
+_parser.add_argument("--log-rmsnorm", dest="log_rmsnorm", action="store_true",
+                    help="Use log-parameterized RMSNorm weights for stable low-precision training (weight = exp(w_log))")
 _parsed, _ = _parser.parse_known_args()
 args.functional_depth_schedule = bool(getattr(_parsed, "functional_depth_schedule", False))
 args.rmsnorm_fp32 = bool(getattr(_parsed, "rmsnorm_fp32", False))
 args.rmsnorm_fp32_fast = bool(getattr(_parsed, "rmsnorm_fp32_fast", False))
+args.log_rmsnorm = bool(getattr(_parsed, "log_rmsnorm", False))
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -1566,7 +1609,7 @@ train_steps = args.num_iterations
 ws_short, ws_long = get_ws(0)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    last_few_steps = (steps >= (train_steps - 5))
+    last_few_steps = (step >= (train_steps - 5))
     ws_short, new_ws_long = get_ws(step)
     if new_ws_long != ws_long:
         model.yarn.apply(ws_long, new_ws_long)
