@@ -959,11 +959,9 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, functional_params=None, functional_use_log_depth: bool = True, rmsnorm_fp32: bool = False, rmsnorm_fp32_fast: bool = False, log_rmsnorm: bool = False):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, rmsnorm_fp32: bool = False, rmsnorm_fp32_fast: bool = False, log_rmsnorm: bool = False):
         super().__init__()
         self.layer_idx = layer_idx
-        self.functional_params = functional_params
-        self.functional_use_log_depth = functional_use_log_depth
         self.rmsnorm_fp32_fast = rmsnorm_fp32_fast
         self.log_rmsnorm = log_rmsnorm
         
@@ -993,30 +991,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim) if layer_idx != 0 else None
-        
-        # Precompute depth input for functional scaling (constant per layer)
-        # This avoids creating tensors and computing log on every forward pass
-        if functional_params is not None:
-            depth_val = math.log(self.layer_idx + 1.0) if functional_use_log_depth else float(self.layer_idx)
-            self.register_buffer('_depth_value', torch.tensor(depth_val, dtype=torch.float32))
-        else:
-            self._depth_value = None
 
-    def _compute_functional_scale(self, branch: str):
-        if self.functional_params is None:
-            return None
-        if branch == "attn":
-            a_param = self.functional_params.get("a_attn", None)
-            b_param = self.functional_params.get("b_attn", None)
-        else:
-            a_param = self.functional_params.get("a_mlp", None)
-            b_param = self.functional_params.get("b_mlp", None)
-        if a_param is None or b_param is None:
-            return None
-        # Use precomputed depth value - avoids tensor creation and log computation
-        return torch.exp(a_param + b_param * self._depth_value)
-
-    def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
+    def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs, attn_scale: Tensor | None = None, mlp_scale: Tensor | None = None):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
             # Compute effective weight for RMSNorm
@@ -1032,10 +1008,9 @@ class Block(nn.Module):
                 attn_weight = self.attn_norm_weight
             
             h = norm(x, attn_weight, self.rmsnorm_fp32_fast)
-            s = self._compute_functional_scale("attn")
-            if s is not None:
+            if attn_scale is not None:
                 # Scale is FP32, convert once and fuse with norm output
-                h = h * s.to(h.dtype)
+                h = h * attn_scale
             x = x + self.attn(h, attn_args)
         if self.mlp is not None:
             # Compute effective weight for RMSNorm
@@ -1051,10 +1026,9 @@ class Block(nn.Module):
                 mlp_weight = self.mlp_norm_weight
             
             h = norm(x, mlp_weight, self.rmsnorm_fp32_fast)
-            s = self._compute_functional_scale("mlp")
-            if s is not None:
+            if mlp_scale is not None:
                 # Scale is FP32, convert once and fuse with norm output
-                h = h * s.to(h.dtype)
+                h = h * mlp_scale
             x = x + self.mlp(h)
         return x
 
@@ -1088,15 +1062,16 @@ class GPT(nn.Module):
             self.func_a_mlp = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
             self.func_b_mlp = nn.Parameter(torch.tensor(-0.5, dtype=torch.float32))
             self.functional_use_log_depth = True
-            _functional_params = {
-                "a_attn": self.func_a_attn,
-                "b_attn": self.func_b_attn,
-                "a_mlp": self.func_a_mlp,
-                "b_mlp": self.func_b_mlp,
-            }
+            # Precompute depth values for all layers as a single tensor (vectorized)
+            # This enables computing all scales at once in forward pass
+            depth_vals = torch.tensor([
+                math.log(i + 1.0) if self.functional_use_log_depth else float(i)
+                for i in range(num_layers)
+            ], dtype=torch.float32)
+            self.register_buffer('_all_depth_values', depth_vals)
         else:
             self.functional_use_log_depth = True
-            _functional_params = None
+            self._all_depth_values = None
         
         # RMSNorm weights for input/final norms
         # Log-parameterized (w_log) or regular weights, optionally in FP32
@@ -1119,11 +1094,12 @@ class GPT(nn.Module):
             self.input_norm_weight = None
             self.final_norm_weight = None
         
-        # Build decoder blocks
+        # Build decoder blocks (no longer pass functional_params dict to avoid lookups)
         self.blocks = nn.ModuleList([
-            Block(model_dim, head_dim, num_heads, i, functional_params=_functional_params, 
-                  functional_use_log_depth=self.functional_use_log_depth, rmsnorm_fp32=self.use_rmsnorm_fp32, 
-                  rmsnorm_fp32_fast=self.use_rmsnorm_fp32_fast, log_rmsnorm=self.use_log_rmsnorm)
+            Block(model_dim, head_dim, num_heads, i, 
+                  rmsnorm_fp32=self.use_rmsnorm_fp32, 
+                  rmsnorm_fp32_fast=self.use_rmsnorm_fp32_fast, 
+                  log_rmsnorm=self.use_log_rmsnorm)
             for i in range(num_layers)
         ])
         self.yarn = Yarn(head_dim, max_seq_len)
@@ -1199,6 +1175,20 @@ class GPT(nn.Module):
         
         x = x0 = norm(x[None], input_weight, self.use_rmsnorm_fp32_fast)
 
+        # Precompute functional depth scales once for all layers (vectorized)
+        # This replaces 24 individual exp() calls with 2 vectorized calls
+        if self.use_functional_depth_schedule:
+            # Compute all attention scales: exp(a_attn + b_attn * depth_values) for all layers
+            attn_scales = torch.exp(self.func_a_attn + self.func_b_attn * self._all_depth_values)
+            # Compute all MLP scales: exp(a_mlp + b_mlp * depth_values) for all layers
+            mlp_scales = torch.exp(self.func_a_mlp + self.func_b_mlp * self._all_depth_values)
+            # Convert to input dtype once (instead of 24 times)
+            attn_scales = attn_scales.to(x.dtype)
+            mlp_scales = mlp_scales.to(x.dtype)
+        else:
+            attn_scales = None
+            mlp_scales = None
+
         # U-net design by @brendanh0gan
         skip_connections = []
         n = len(self.blocks) // 2
@@ -1220,7 +1210,10 @@ class GPT(nn.Module):
             if i >= n and i<11:
                 gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
                 x = x + gate * skip_connections.pop()
-            x = self.blocks[i](x, x0, lambdas[i], attn_args)
+            # Pass precomputed scales to block (None if not using functional depth)
+            attn_scale = attn_scales[i] if attn_scales is not None else None
+            mlp_scale = mlp_scales[i] if mlp_scales is not None else None
+            x = self.blocks[i](x, x0, lambdas[i], attn_args, attn_scale, mlp_scale)
             if i < n:
                 skip_connections.append(x)
             if i == backout_layer:
