@@ -992,7 +992,7 @@ class Block(nn.Module):
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim) if layer_idx != 0 else None
 
-    def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs, attn_scale: Tensor | None = None, mlp_scale: Tensor | None = None):
+    def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs, attn_scale: Tensor | None = None, mlp_scale: Tensor | None = None, lns_scale: Tensor | None = None):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
             # Compute effective weight for RMSNorm
@@ -1008,8 +1008,10 @@ class Block(nn.Module):
                 attn_weight = self.attn_norm_weight
             
             h = norm(x, attn_weight, self.rmsnorm_fp32_fast)
+            # Apply LNS scaling first (if enabled), then functional depth scaling
+            if lns_scale is not None:
+                h = h * lns_scale
             if attn_scale is not None:
-                # Scale is FP32, convert once and fuse with norm output
                 h = h * attn_scale
             x = x + self.attn(h, attn_args)
         if self.mlp is not None:
@@ -1026,8 +1028,10 @@ class Block(nn.Module):
                 mlp_weight = self.mlp_norm_weight
             
             h = norm(x, mlp_weight, self.rmsnorm_fp32_fast)
+            # Apply LNS scaling first (if enabled), then functional depth scaling
+            if lns_scale is not None:
+                h = h * lns_scale
             if mlp_scale is not None:
-                # Scale is FP32, convert once and fuse with norm output
                 h = h * mlp_scale
             x = x + self.mlp(h)
         return x
@@ -1054,6 +1058,7 @@ class GPT(nn.Module):
         self.use_rmsnorm_fp32 = bool(getattr(args, "rmsnorm_fp32", False))
         self.use_rmsnorm_fp32_fast = bool(getattr(args, "rmsnorm_fp32_fast", False))
         self.use_log_rmsnorm = bool(getattr(args, "log_rmsnorm", False))
+        self.use_lns = bool(getattr(args, "lns", False))
         
         # Functional depth schedule shared parameters (FP32)
         if self.use_functional_depth_schedule:
@@ -1072,6 +1077,20 @@ class GPT(nn.Module):
         else:
             self.functional_use_log_depth = True
             self._all_depth_values = None
+        
+        # Layer Norm Scaling (LNS): scale norm outputs by 1/sqrt(layer_idx+1)
+        # Precompute all scales at initialization for optimal performance
+        if self.use_lns:
+            # Scales for each layer: 1/sqrt(layer_idx + 1)
+            # Layer 0 (input_norm): 1/sqrt(1) = 1.0
+            # Layer i (blocks[i]): 1/sqrt(i+1)
+            # Layer num_layers (final_norm): 1/sqrt(num_layers+1)
+            lns_scales = torch.tensor([
+                1.0 / math.sqrt(i + 1.0) for i in range(num_layers + 1)
+            ], dtype=torch.float32)
+            self.register_buffer('_lns_scales', lns_scales)
+        else:
+            self._lns_scales = None
         
         # RMSNorm weights for input/final norms
         # Log-parameterized (w_log) or regular weights, optionally in FP32
@@ -1174,6 +1193,10 @@ class GPT(nn.Module):
             input_weight = getattr(self, "input_norm_weight", None)
         
         x = x0 = norm(x[None], input_weight, self.use_rmsnorm_fp32_fast)
+        
+        # Apply LNS scaling to input norm (layer 0)
+        if self.use_lns:
+            x = x0 = x * self._lns_scales[0].to(x.dtype)
 
         # Precompute functional depth scales once for all layers (vectorized)
         # This replaces 24 individual exp() calls with 2 vectorized calls
@@ -1188,6 +1211,17 @@ class GPT(nn.Module):
         else:
             attn_scales = None
             mlp_scales = None
+        
+        # Precompute LNS scales for all blocks (convert to input dtype once)
+        if self.use_lns:
+            # _lns_scales[0] is for input_norm (already applied above)
+            # _lns_scales[1:num_layers+1] are for blocks[0:num_layers]
+            # _lns_scales[num_layers] is for final_norm
+            lns_block_scales = self._lns_scales[1:len(self.blocks)+1].to(x.dtype)
+            lns_final_scale = self._lns_scales[len(self.blocks)].to(x.dtype)
+        else:
+            lns_block_scales = None
+            lns_final_scale = None
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -1210,10 +1244,11 @@ class GPT(nn.Module):
             if i >= n and i<11:
                 gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
                 x = x + gate * skip_connections.pop()
-            # Pass precomputed scales to block (None if not using functional depth)
+            # Pass precomputed scales to block (None if not using)
             attn_scale = attn_scales[i] if attn_scales is not None else None
             mlp_scale = mlp_scales[i] if mlp_scales is not None else None
-            x = self.blocks[i](x, x0, lambdas[i], attn_args, attn_scale, mlp_scale)
+            lns_scale = lns_block_scales[i] if lns_block_scales is not None else None
+            x = self.blocks[i](x, x0, lambdas[i], attn_args, attn_scale, mlp_scale, lns_scale)
             if i < n:
                 skip_connections.append(x)
             if i == backout_layer:
@@ -1235,6 +1270,11 @@ class GPT(nn.Module):
             final_weight = getattr(self, "final_norm_weight", None)
         
         x = norm(x, final_weight, self.use_rmsnorm_fp32_fast)
+        
+        # Apply LNS scaling to final norm
+        if self.use_lns:
+            x = x * lns_final_scale
+        
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
@@ -1465,11 +1505,14 @@ _parser.add_argument("--rmsnorm-fp32-fast", dest="rmsnorm_fp32_fast", action="st
                     help="Use fused RMSNorm kernel by casting weights to input dtype (faster but less precise)")
 _parser.add_argument("--log-rmsnorm", dest="log_rmsnorm", action="store_true",
                     help="Use log-parameterized RMSNorm weights for stable low-precision training (weight = exp(w_log))")
+_parser.add_argument("--lns", dest="lns", action="store_true",
+                    help="Apply Layer Norm Scaling: scale norm outputs by 1/sqrt(layer_idx+1)")
 _parsed, _ = _parser.parse_known_args()
 args.functional_depth_schedule = bool(getattr(_parsed, "functional_depth_schedule", False))
 args.rmsnorm_fp32 = bool(getattr(_parsed, "rmsnorm_fp32", False))
 args.rmsnorm_fp32_fast = bool(getattr(_parsed, "rmsnorm_fp32_fast", False))
 args.log_rmsnorm = bool(getattr(_parsed, "log_rmsnorm", False))
+args.lns = bool(getattr(_parsed, "lns", False))
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
