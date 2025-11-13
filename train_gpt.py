@@ -1566,13 +1566,14 @@ train_steps = args.num_iterations
 ws_short, ws_long = get_ws(0)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
+    last_few_steps = (steps >= (train_steps - 5))
     ws_short, new_ws_long = get_ws(step)
     if new_ws_long != ws_long:
         model.yarn.apply(ws_long, new_ws_long)
         ws_long=new_ws_long
 
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if last_step or last_few_steps or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
             ws_long = args.ws_validate_post_yarn_ext
         # stop the clock
