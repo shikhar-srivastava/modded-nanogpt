@@ -658,10 +658,16 @@ class DistAdam(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
         # init state
         for p in params:
-            chunk_size = p.size(0) // self.world_size
-            exp_avg = torch.zeros_like(p[:chunk_size], dtype=torch.bfloat16, device=p[0].device)
-            exp_avg_sq = torch.zeros_like(exp_avg)
-            self.state[p] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=exp_avg_sq)
+            # For 0D tensors or tensors too small to split, replicate the state on all ranks
+            if p.ndim == 0 or p.size(0) < self.world_size:
+                exp_avg = torch.zeros_like(p, dtype=torch.bfloat16, device=p.device if p.ndim == 0 else p[0].device)
+                exp_avg_sq = torch.zeros_like(exp_avg)
+                self.state[p] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=exp_avg_sq, replicated=True)
+            else:
+                chunk_size = p.size(0) // self.world_size
+                exp_avg = torch.zeros_like(p[:chunk_size], dtype=torch.bfloat16, device=p[0].device)
+                exp_avg_sq = torch.zeros_like(exp_avg)
+                self.state[p] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=exp_avg_sq, replicated=False)
         # DistributedAdam implementation by @vagrawal
 
     @torch.compile
@@ -677,10 +683,17 @@ class DistAdam(torch.optim.Optimizer):
                 grad = param.grad
                 if grad is None:
                     continue
-                rank_size = grad.shape[0] // self.world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
-                reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
-                grad_slices.append(grad_slice)
+                # Handle replicated parameters (0D or too small to split)
+                state = self.state[param]
+                if state.get("replicated", False):
+                    # For replicated params, just store the grad (will be all-reduced later)
+                    grad_slices.append(grad)
+                    reduce_scatter_futures.append(None)
+                else:
+                    rank_size = grad.shape[0] // self.world_size
+                    grad_slice = torch.empty_like(grad[:rank_size])
+                    reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
+                    grad_slices.append(grad_slice)
 
         idx = 0
         for group in self.param_groups:
@@ -691,34 +704,61 @@ class DistAdam(torch.optim.Optimizer):
             for param in params:
                 if param.grad is None:
                     continue
-                reduce_scatter_futures[idx].wait()
-                rank_size = param.shape[0] // self.world_size
-                p_slice = param[rank * rank_size:(rank + 1) * rank_size]
-                lr = group['lr'] * getattr(param, "lr_mul", 1.0)
                 state = self.state[param]
                 g_slice = grad_slices[idx]
+                lr = group['lr'] * getattr(param, "lr_mul", 1.0)
+                
+                if state.get("replicated", False):
+                    # For replicated params, work with the full parameter
+                    # First average gradients across ranks
+                    dist.all_reduce(g_slice, op=dist.ReduceOp.AVG)
+                    
+                    exp_avg = state["exp_avg"]
+                    exp_avg_sq = state["exp_avg_sq"]
+                    state["step"] += 1
+                    t = state["step"]
+                    # weight decay
+                    if wd != 0:
+                        eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
+                        param.mul_(1 - eff_weight_decay)
+                    # update running averages
+                    exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+                    # bias corrections
+                    bias1 = 1 - beta1 ** t
+                    bias2 = 1 - beta2 ** t
+                    # compute step
+                    denom = exp_avg_sq.sqrt().add_(eps)
+                    step_size = lr * (bias2 ** 0.5 / bias1)
+                    update = exp_avg.div(denom).mul_(step_size)
+                    param.add_(other=update, alpha=-1.0)
+                else:
+                    # For split params, use the original logic
+                    reduce_scatter_futures[idx].wait()
+                    rank_size = param.shape[0] // self.world_size
+                    p_slice = param[rank * rank_size:(rank + 1) * rank_size]
 
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-                state["step"] += 1
-                t = state["step"]
-                # weight decay
-                if wd != 0:
-                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
-                    p_slice.mul_(1 - eff_weight_decay)
-                # update running averages
-                exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
-                # bias corrections
-                bias1 = 1 - beta1 ** t
-                bias2 = 1 - beta2 ** t
-                # compute step
-                denom = exp_avg_sq.sqrt().add_(eps)
-                step_size = lr * (bias2 ** 0.5 / bias1)
-                update = exp_avg.div(denom).mul_(step_size)
-                p_slice.add_(other=update, alpha=-1.0)
+                    exp_avg = state["exp_avg"]
+                    exp_avg_sq = state["exp_avg_sq"]
+                    state["step"] += 1
+                    t = state["step"]
+                    # weight decay
+                    if wd != 0:
+                        eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
+                        p_slice.mul_(1 - eff_weight_decay)
+                    # update running averages
+                    exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+                    # bias corrections
+                    bias1 = 1 - beta1 ** t
+                    bias2 = 1 - beta2 ** t
+                    # compute step
+                    denom = exp_avg_sq.sqrt().add_(eps)
+                    step_size = lr * (bias2 ** 0.5 / bias1)
+                    update = exp_avg.div(denom).mul_(step_size)
+                    p_slice.add_(other=update, alpha=-1.0)
+                    all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
                 idx += 1
-                all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
         torch.futures.collect_all(all_gather_futures).wait()
 
 # -----------------------------------------------------------------------------
