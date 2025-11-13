@@ -1019,14 +1019,38 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
-            h = norm(x, self.attn_norm_weight, self.rmsnorm_fp32_fast, self.log_rmsnorm)
+            # Compute effective weight for RMSNorm
+            if self.log_rmsnorm and self.attn_norm_weight is not None:
+                # Log-parameterized: weight = exp(w_log)
+                # Compute exp in FP32 for precision if weight is FP32 and not fast mode
+                if self.attn_norm_weight.dtype == torch.float32 and not self.rmsnorm_fp32_fast:
+                    attn_weight = torch.exp(self.attn_norm_weight)
+                else:
+                    # Compute in input dtype for fused kernel path
+                    attn_weight = torch.exp(self.attn_norm_weight.to(x.dtype))
+            else:
+                attn_weight = self.attn_norm_weight
+            
+            h = norm(x, attn_weight, self.rmsnorm_fp32_fast)
             s = self._compute_functional_scale("attn")
             if s is not None:
                 # Scale is FP32, convert once and fuse with norm output
                 h = h * s.to(h.dtype)
             x = x + self.attn(h, attn_args)
         if self.mlp is not None:
-            h = norm(x, self.mlp_norm_weight, self.rmsnorm_fp32_fast, self.log_rmsnorm)
+            # Compute effective weight for RMSNorm
+            if self.log_rmsnorm and self.mlp_norm_weight is not None:
+                # Log-parameterized: weight = exp(w_log)
+                # Compute exp in FP32 for precision if weight is FP32 and not fast mode
+                if self.mlp_norm_weight.dtype == torch.float32 and not self.rmsnorm_fp32_fast:
+                    mlp_weight = torch.exp(self.mlp_norm_weight)
+                else:
+                    # Compute in input dtype for fused kernel path
+                    mlp_weight = torch.exp(self.mlp_norm_weight.to(x.dtype))
+            else:
+                mlp_weight = self.mlp_norm_weight
+            
+            h = norm(x, mlp_weight, self.rmsnorm_fp32_fast)
             s = self._compute_functional_scale("mlp")
             if s is not None:
                 # Scale is FP32, convert once and fuse with norm output
@@ -1160,7 +1184,20 @@ class GPT(nn.Module):
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
-        x = x0 = norm(x[None], getattr(self, "input_norm_weight", None), self.use_rmsnorm_fp32_fast, self.use_log_rmsnorm)
+        
+        # Compute effective weight for input norm
+        if self.use_log_rmsnorm and self.input_norm_weight is not None:
+            # Log-parameterized: weight = exp(w_log)
+            # Compute exp in FP32 for precision if weight is FP32 and not fast mode
+            if self.input_norm_weight.dtype == torch.float32 and not self.use_rmsnorm_fp32_fast:
+                input_weight = torch.exp(self.input_norm_weight)
+            else:
+                # Compute in input dtype for fused kernel path
+                input_weight = torch.exp(self.input_norm_weight.to(x.dtype))
+        else:
+            input_weight = getattr(self, "input_norm_weight", None)
+        
+        x = x0 = norm(x[None], input_weight, self.use_rmsnorm_fp32_fast)
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -1191,7 +1228,20 @@ class GPT(nn.Module):
 
         # back out contributions from first 8 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
-        x = norm(x, getattr(self, "final_norm_weight", None), self.use_rmsnorm_fp32_fast, self.use_log_rmsnorm)
+        
+        # Compute effective weight for final norm
+        if self.use_log_rmsnorm and self.final_norm_weight is not None:
+            # Log-parameterized: weight = exp(w_log)
+            # Compute exp in FP32 for precision if weight is FP32 and not fast mode
+            if self.final_norm_weight.dtype == torch.float32 and not self.use_rmsnorm_fp32_fast:
+                final_weight = torch.exp(self.final_norm_weight)
+            else:
+                # Compute in input dtype for fused kernel path
+                final_weight = torch.exp(self.final_norm_weight.to(x.dtype))
+        else:
+            final_weight = getattr(self, "final_norm_weight", None)
+        
+        x = norm(x, final_weight, self.use_rmsnorm_fp32_fast)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)

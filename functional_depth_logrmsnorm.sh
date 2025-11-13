@@ -1,7 +1,6 @@
 #!/bin/bash
-# Log-parameterized RMSNorm with functional depth scheduling (BF16 w_log)
-# LogRMSNorm: Uses w_log parameters where weight = exp(w_log)
-# Benefits: More stable gradient updates in low-precision training
-# w_log will be cast to BF16 (model dtype)
+# Log-parameterized RMSNorm with functional depth schedule
+# Uses w_log parameters (default BF16) for fastest fused kernel path
+# Weight = exp(w_log), computed in BF16 to match activations
+# Minimal overhead while maintaining stable low-precision training
 torchrun --standalone --nproc_per_node=4 train_gpt.py --log-rmsnorm --functional-depth-schedule
-
