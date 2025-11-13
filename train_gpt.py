@@ -763,8 +763,40 @@ class DistAdam(torch.optim.Optimizer):
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
-def norm(x: Tensor, weight: Tensor | None = None):
-    return F.rms_norm(x, (x.size(-1),), weight=weight)
+
+# Optimized RMSNorm with optional FP32 computation
+# Approach follows large-activations implementation: normalize in FP32,
+# then match dtypes for weight multiplication
+def norm(x: Tensor, weight: Tensor | None = None, fast_mode: bool = False):
+    if weight is None:
+        # No weight: just use fused kernel
+        return F.rms_norm(x, (x.size(-1),), weight=None)
+    
+    if weight.dtype == x.dtype:
+        # Same dtype: use fused kernel directly
+        return F.rms_norm(x, (x.size(-1),), weight=weight)
+    
+    # Different dtypes (FP32 weight with BF16 input):
+    if fast_mode:
+        # Fast mode: cast weight to input dtype to use fused kernel
+        return F.rms_norm(x, (x.size(-1),), weight=weight.to(x.dtype))
+    else:
+        # Precise mode: manual FP32 computation following large-activations pattern
+        original_dtype = x.dtype
+        # Normalize in FP32
+        variance = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+        x_normalized = x * torch.rsqrt(variance + 1e-6)
+        
+        # Convert normalized activations to match weight dtype (FP32) for multiplication
+        if weight.dtype != x_normalized.dtype:
+            x_normalized = x_normalized.to(weight.dtype)
+        
+        output = weight * x_normalized
+        
+        # Convert back to original dtype
+        if output.dtype != original_dtype:
+            output = output.to(original_dtype)
+        return output
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
@@ -927,11 +959,12 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, functional_params=None, functional_use_log_depth: bool = True, rmsnorm_fp32: bool = False):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, functional_params=None, functional_use_log_depth: bool = True, rmsnorm_fp32: bool = False, rmsnorm_fp32_fast: bool = False):
         super().__init__()
         self.layer_idx = layer_idx
         self.functional_params = functional_params
         self.functional_use_log_depth = functional_use_log_depth
+        self.rmsnorm_fp32_fast = rmsnorm_fp32_fast
         # Optional FP32 RMSNorm weights (stored as parameters to ensure FP32 state/updates)
         self.attn_norm_weight = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if rmsnorm_fp32 else None
         self.mlp_norm_weight = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if rmsnorm_fp32 else None
@@ -939,6 +972,14 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim) if layer_idx != 0 else None
+        
+        # Precompute depth input for functional scaling (constant per layer)
+        # This avoids creating tensors and computing log on every forward pass
+        if functional_params is not None:
+            depth_val = math.log(self.layer_idx + 1.0) if functional_use_log_depth else float(self.layer_idx)
+            self.register_buffer('_depth_value', torch.tensor(depth_val, dtype=torch.float32))
+        else:
+            self._depth_value = None
 
     def _compute_functional_scale(self, branch: str):
         if self.functional_params is None:
@@ -951,22 +992,24 @@ class Block(nn.Module):
             b_param = self.functional_params.get("b_mlp", None)
         if a_param is None or b_param is None:
             return None
-        depth_input = math.log(self.layer_idx + 1.0) if self.functional_use_log_depth else float(self.layer_idx)
-        return torch.exp(a_param + b_param * torch.tensor(depth_input, dtype=torch.float32, device=a_param.device))
+        # Use precomputed depth value - avoids tensor creation and log computation
+        return torch.exp(a_param + b_param * self._depth_value)
 
     def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
-            h = norm(x, self.attn_norm_weight)
+            h = norm(x, self.attn_norm_weight, self.rmsnorm_fp32_fast)
             s = self._compute_functional_scale("attn")
             if s is not None:
-                h = h * s.to(dtype=h.dtype)
+                # Scale is FP32, convert once and fuse with norm output
+                h = h * s.to(h.dtype)
             x = x + self.attn(h, attn_args)
         if self.mlp is not None:
-            h = norm(x, self.mlp_norm_weight)
+            h = norm(x, self.mlp_norm_weight, self.rmsnorm_fp32_fast)
             s = self._compute_functional_scale("mlp")
             if s is not None:
-                h = h * s.to(dtype=h.dtype)
+                # Scale is FP32, convert once and fuse with norm output
+                h = h * s.to(h.dtype)
             x = x + self.mlp(h)
         return x
 
@@ -990,6 +1033,7 @@ class GPT(nn.Module):
         # Optional features via argparse flags
         self.use_functional_depth_schedule = bool(getattr(args, "functional_depth_schedule", False))
         self.use_rmsnorm_fp32 = bool(getattr(args, "rmsnorm_fp32", False))
+        self.use_rmsnorm_fp32_fast = bool(getattr(args, "rmsnorm_fp32_fast", False))
         # Functional depth schedule shared parameters (FP32)
         if self.use_functional_depth_schedule:
             self.func_a_attn = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
@@ -1015,7 +1059,7 @@ class GPT(nn.Module):
             self.final_norm_weight = None
         # Build decoder blocks
         self.blocks = nn.ModuleList([
-            Block(model_dim, head_dim, num_heads, i, functional_params=_functional_params, functional_use_log_depth=self.functional_use_log_depth, rmsnorm_fp32=self.use_rmsnorm_fp32)
+            Block(model_dim, head_dim, num_heads, i, functional_params=_functional_params, functional_use_log_depth=self.functional_use_log_depth, rmsnorm_fp32=self.use_rmsnorm_fp32, rmsnorm_fp32_fast=self.use_rmsnorm_fp32_fast)
             for i in range(num_layers)
         ])
         self.yarn = Yarn(head_dim, max_seq_len)
@@ -1076,7 +1120,7 @@ class GPT(nn.Module):
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
-        x = x0 = norm(x[None], getattr(self, "input_norm_weight", None))
+        x = x0 = norm(x[None], getattr(self, "input_norm_weight", None), self.use_rmsnorm_fp32_fast)
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -1107,7 +1151,7 @@ class GPT(nn.Module):
 
         # back out contributions from first 8 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
-        x = norm(x, getattr(self, "final_norm_weight", None))
+        x = norm(x, getattr(self, "final_norm_weight", None), self.use_rmsnorm_fp32_fast)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
@@ -1334,9 +1378,12 @@ args.val_files = os.path.join(data_path, args.val_files)
 _parser = argparse.ArgumentParser(add_help=False)
 _parser.add_argument("--functional-depth-schedule", dest="functional_depth_schedule", action="store_true")
 _parser.add_argument("--rmsnorm-fp32", dest="rmsnorm_fp32", action="store_true")
+_parser.add_argument("--rmsnorm-fp32-fast", dest="rmsnorm_fp32_fast", action="store_true",
+                    help="Use fused RMSNorm kernel by casting weights to input dtype (faster but less precise)")
 _parsed, _ = _parser.parse_known_args()
 args.functional_depth_schedule = bool(getattr(_parsed, "functional_depth_schedule", False))
 args.rmsnorm_fp32 = bool(getattr(_parsed, "rmsnorm_fp32", False))
+args.rmsnorm_fp32_fast = bool(getattr(_parsed, "rmsnorm_fp32_fast", False))
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
