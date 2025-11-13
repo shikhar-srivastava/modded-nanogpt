@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 from itertools import accumulate
 from pathlib import Path
+import argparse
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -718,9 +719,8 @@ class DistAdam(torch.optim.Optimizer):
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
-
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
+def norm(x: Tensor, weight: Tensor | None = None):
+    return F.rms_norm(x, (x.size(-1),), weight=weight)
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
@@ -883,19 +883,47 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, functional_params=None, functional_use_log_depth: bool = True, rmsnorm_fp32: bool = False):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.functional_params = functional_params
+        self.functional_use_log_depth = functional_use_log_depth
+        # Optional FP32 RMSNorm weights (stored as parameters to ensure FP32 state/updates)
+        self.attn_norm_weight = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if rmsnorm_fp32 else None
+        self.mlp_norm_weight = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if rmsnorm_fp32 else None
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim) if layer_idx != 0 else None
 
+    def _compute_functional_scale(self, branch: str):
+        if self.functional_params is None:
+            return None
+        if branch == "attn":
+            a_param = self.functional_params.get("a_attn", None)
+            b_param = self.functional_params.get("b_attn", None)
+        else:
+            a_param = self.functional_params.get("a_mlp", None)
+            b_param = self.functional_params.get("b_mlp", None)
+        if a_param is None or b_param is None:
+            return None
+        depth_input = math.log(self.layer_idx + 1.0) if self.functional_use_log_depth else float(self.layer_idx)
+        return torch.exp(a_param + b_param * torch.tensor(depth_input, dtype=torch.float32, device=a_param.device))
+
     def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), attn_args)
+            h = norm(x, self.attn_norm_weight)
+            s = self._compute_functional_scale("attn")
+            if s is not None:
+                h = h * s.to(dtype=h.dtype)
+            x = x + self.attn(h, attn_args)
         if self.mlp is not None:
-            x = x + self.mlp(norm(x))
+            h = norm(x, self.mlp_norm_weight)
+            s = self._compute_functional_scale("mlp")
+            if s is not None:
+                h = h * s.to(dtype=h.dtype)
+            x = x + self.mlp(h)
         return x
 
 # -----------------------------------------------------------------------------
@@ -915,7 +943,37 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
+        # Optional features via argparse flags
+        self.use_functional_depth_schedule = bool(getattr(args, "functional_depth_schedule", False))
+        self.use_rmsnorm_fp32 = bool(getattr(args, "rmsnorm_fp32", False))
+        # Functional depth schedule shared parameters (FP32)
+        if self.use_functional_depth_schedule:
+            self.func_a_attn = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+            self.func_b_attn = nn.Parameter(torch.tensor(-0.5, dtype=torch.float32))
+            self.func_a_mlp = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+            self.func_b_mlp = nn.Parameter(torch.tensor(-0.5, dtype=torch.float32))
+            self.functional_use_log_depth = True
+            _functional_params = {
+                "a_attn": self.func_a_attn,
+                "b_attn": self.func_b_attn,
+                "a_mlp": self.func_a_mlp,
+                "b_mlp": self.func_b_mlp,
+            }
+        else:
+            self.functional_use_log_depth = True
+            _functional_params = None
+        # Optional FP32 RMSNorm weights for input/final norms
+        if self.use_rmsnorm_fp32:
+            self.input_norm_weight = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+            self.final_norm_weight = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+        else:
+            self.input_norm_weight = None
+            self.final_norm_weight = None
+        # Build decoder blocks
+        self.blocks = nn.ModuleList([
+            Block(model_dim, head_dim, num_heads, i, functional_params=_functional_params, functional_use_log_depth=self.functional_use_log_depth, rmsnorm_fp32=self.use_rmsnorm_fp32)
+            for i in range(num_layers)
+        ])
         self.yarn = Yarn(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -974,7 +1032,7 @@ class GPT(nn.Module):
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
-        x = x0 = norm(x[None])
+        x = x0 = norm(x[None], getattr(self, "input_norm_weight", None))
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -1005,7 +1063,7 @@ class GPT(nn.Module):
 
         # back out contributions from first 8 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
-        x = norm(x)
+        x = norm(x, getattr(self, "final_norm_weight", None))
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
@@ -1219,12 +1277,22 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
+    # optional features
+    functional_depth_schedule: bool = False
+    rmsnorm_fp32: bool = False
 
 args = Hyperparameters()
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
 args.val_files = os.path.join(data_path, args.val_files)
+# Parse optional flags (ignore unknown args to be torchrun-friendly)
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--functional-depth-schedule", dest="functional_depth_schedule", action="store_true")
+_parser.add_argument("--rmsnorm-fp32", dest="rmsnorm_fp32", action="store_true")
+_parsed, _ = _parser.parse_known_args()
+args.functional_depth_schedule = bool(getattr(_parsed, "functional_depth_schedule", False))
+args.rmsnorm_fp32 = bool(getattr(_parsed, "rmsnorm_fp32", False))
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
